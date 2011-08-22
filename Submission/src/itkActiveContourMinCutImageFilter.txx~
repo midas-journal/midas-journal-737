@@ -1,0 +1,497 @@
+/*=========================================================================
+
+  Program:   Insight Segmentation & Registration Toolkit
+  Module:    $itkActiveContourMinCutImageFilter.txx $
+  Language:  C++
+  Date:      $Date: 2010/06/26 $
+  Version:   $Revision: 1.0 $
+  Author:    David Pellow <david.pellow@utoronto.ca>
+
+
+     This software is distributed WITHOUT ANY WARRANTY; without even 
+     the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     PURPOSE.  See the above copyright notices for more information.
+
+=========================================================================*/
+
+
+//boost includes
+#include <boost/graph/kolmogorov_max_flow.hpp>
+#include <boost/graph/adjacency_list.hpp>
+#include <boost/graph/write_dimacs.hpp>
+#include <boost/config.hpp>
+
+#include <iostream>
+#include <string>
+#include <cstdio>
+#include <cmath>
+
+
+#include "itkImageRegionConstIteratorWithIndex.h"
+#include "itkImageRegionIteratorWithIndex.h"
+#include "itkConstNeighborhoodIterator.h"
+#include "itkImage.h"
+#include "itkImageFileWriter.h"
+
+
+//#define NDEBUG
+
+namespace boost{
+    struct Arc;
+    struct Node;
+    typedef adjacency_list<vecS,vecS,directedS,Node,Arc> Graph;
+    struct Arc {
+        float capacity;
+        float residual_capacity;
+        Graph::edge_descriptor reverse;
+    };
+    struct Node {
+        std::string name;
+        Graph::edge_descriptor predecessor;
+        default_color_type color;
+        float distance;
+        long index;
+    };
+}
+
+
+namespace itk 
+{
+
+template <class TInputImageType, class TOutputImageType>
+float ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>::
+computeEdgeWeight (const typename TInputImageType::PixelType &a, const typename TInputImageType::PixelType &b, 
+		const typename TInputImageType::PixelType &sigma)
+{
+	float diff = (b-a)*(b-a);
+	float val = exp (-(diff/(sigma*sigma)));
+	return val;
+}
+
+
+template <class TInputImageType, class TOutputImageType>
+ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>
+::ActiveContourMinCutImageFilter() :
+m_UncertaintyRadius (5.0), m_NumberOfBackgroundClasses(4)
+{
+	m_BackgroundMeans.push_back(-200);
+	m_BackgroundMeans.push_back(100);
+	m_BackgroundMeans.push_back(200);
+	m_BackgroundMeans.push_back(300);
+
+	m_InitialProportions.push_back(0.01);
+	m_InitialProportions.push_back(0.04);
+	m_InitialProportions.push_back(0.005);
+	m_InitialProportions.push_back(0.003);
+	m_InitialProportions.push_back(0.002);
+	m_InitialProportions.push_back(0.94);
+} 
+
+
+template <class TInputImageType, class TOutputImageType>
+void
+ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>
+::SetInitialMeans(const std::vector<double> & initialMeans)
+{
+	for (unsigned i = 0; i < m_NumberOfBackgroundClasses; i++)
+		m_BackgroundMeans.push_back(initialMeans[i]);
+}
+
+
+template <class TInputImageType, class TOutputImageType>
+void
+ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>
+::SetInitialProportions(const std::vector<double> & initialProps)
+{
+	for (unsigned i = 0; i < m_NumberOfBackgroundClasses+2; i++)
+		m_InitialProportions.push_back(initialProps[i]);
+}
+
+
+template <class TInputImageType, class TOutputImageType>
+void
+ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>::
+GenerateData()
+{
+	
+	//compute path std
+	typename itkLabelStatisticsImageFilterType::Pointer pathStat = itkLabelStatisticsImageFilterType::New();
+	pathStat->SetInput (this->GetInput());
+	pathStat->SetLabelInput (m_ObjImage);
+	pathStat->Update();
+	double  pathStd = 0.3*pathStat-> GetSigma (1);
+        double  pathMean = pathStat-> GetMean (1);
+	if (pathStd == 0)
+	{
+		pathStd = 1;
+	}
+#ifndef NDEBUG
+	std::cout << "pathStd: " << pathStd << std::endl;
+        std::cout << "pathMean: " << pathMean << std::endl;
+#endif
+
+	
+	// build distance map	
+	typename itkDanielssonDistanceMapImageFilterType::Pointer edt = itkDanielssonDistanceMapImageFilterType::New();
+	edt->SetInput(m_ObjImage);
+	edt->UseImageSpacingOn ();
+	edt->Update();
+#ifndef NDEBUG
+	std::cout << "Done distance map" << std::endl;
+#endif	
+
+	//create mask image
+	typename TOutputImageType::Pointer writeTo = TOutputImageType::New();
+	writeTo->SetSpacing(this->GetInput()->GetSpacing());
+	writeTo->SetOrigin(this->GetInput()->GetOrigin());
+	writeTo->SetRegions(this->GetInput()->GetLargestPossibleRegion());
+	writeTo->Allocate();
+	
+	//count pixels in the mask
+	typename TInputImageType::Pointer vertexIndices = TInputImageType::New();
+	vertexIndices->SetSpacing(this->GetInput()->GetSpacing());
+	vertexIndices->SetOrigin(this->GetInput()->GetOrigin());
+	vertexIndices->SetRegions(this->GetInput()->GetLargestPossibleRegion());
+	vertexIndices->Allocate();
+
+	typename InnerImageType::Pointer maskWeights = edt->GetOutput();
+
+	typedef itk::ImageRegionIterator <TInputImageType> itkInputImageRegionIteratorType;
+	typedef itk::ImageRegionIterator <TOutputImageType> itkOutputImageRegionIteratorType;
+	typedef itk::ImageRegionConstIterator <TInputImageType> itkInputImageRegionConstIteratorType;
+	typedef itk::ImageRegionConstIterator <InnerImageType> itkInnerImageRegionConstIteratorType;
+
+	itkInnerImageRegionConstIteratorType maskWeightsIter (maskWeights, maskWeights->GetRequestedRegion());
+	itkInputImageRegionIteratorType vertexIter(vertexIndices, vertexIndices->GetRequestedRegion());
+	itkOutputImageRegionIteratorType writeIter(writeTo, writeTo->GetRequestedRegion());
+	itkInputImageRegionConstIteratorType inputIter(this->GetInput(), this->GetInput()->GetRequestedRegion());
+	
+	int node_num = 1;
+
+	for (maskWeightsIter.GoToBegin(), vertexIter.GoToBegin(), inputIter.GoToBegin(), writeIter.GoToBegin();
+			!maskWeightsIter.IsAtEnd(); ++maskWeightsIter, ++vertexIter, ++inputIter, ++writeIter)
+	{
+		if (maskWeightsIter.Value() < m_UncertaintyRadius) 
+		{
+			vertexIter.Value() = node_num;
+			++node_num;
+
+			writeIter.Value() = inputIter.Value();
+		}
+		else
+		{
+			vertexIter.Value() = -1;
+
+			writeIter.Value() = 0;
+		}
+	}
+
+
+#ifndef NDEBUG
+	typedef itk::ImageFileWriter<TOutputImageType> WriterType;
+	typename WriterType::Pointer maskWriter = WriterType::New();
+	maskWriter->SetFileName("maskImage.vtk");
+	maskWriter->SetInput (writeTo);
+  
+	try
+   	 {
+		maskWriter->Update();
+   	 }
+	catch( itk::ExceptionObject & excp )
+   	 {
+		std::cerr << "Problem encountered while writing ";
+		std::cerr << " image file : " << "maskImage.vtk" << std::endl;
+		std::cerr << excp << std::endl;
+   	 }
+
+	std::cout << "done mask" << std::endl;
+#endif
+
+
+	//find class properties
+	unsigned int numberOfClasses = m_NumberOfBackgroundClasses+2;	
+	typename itkGMMEstimatorImageFilterType::Pointer meansEstimator = itkGMMEstimatorImageFilterType::New();
+	meansEstimator->SetInput(writeTo);
+	meansEstimator->SetNumberOfClasses(numberOfClasses);
+	std::vector<double> initialProps (numberOfClasses);
+	std::vector<double> initialMeans (numberOfClasses);
+	std::vector<double> initialStd (numberOfClasses);
+
+	initialMeans[0] = pathMean;
+	initialStd[0] = pathStd*pathStd;
+	initialProps[0] = m_InitialProportions[0];
+
+	for (unsigned i = 1; i < numberOfClasses-1; i++)
+	{
+		initialMeans[i] = pathMean + m_BackgroundMeans[i-1];
+		initialStd[i] = pathStd*pathStd;
+		initialProps[i] = m_InitialProportions[i];
+	}
+	
+	initialMeans[numberOfClasses-1] = 0;
+	initialStd[numberOfClasses-1] = 1;
+	initialProps[numberOfClasses-1] = m_InitialProportions[numberOfClasses-1];
+
+	meansEstimator->SetInitialParams (initialMeans, initialStd, initialProps);
+	meansEstimator->Update();
+
+	double classMeans [numberOfClasses];
+	double classStd[numberOfClasses];
+	double class_mean, class_std;
+	for (unsigned i = 0; i < numberOfClasses; i++)
+	{
+		meansEstimator->GetClassParams(i, class_mean, class_std);
+		
+		classMeans[i] = class_mean;
+		classStd[i] = class_std;
+	}
+
+#ifndef NDEBUG
+	std::cout << "done means estimator" << std::endl;
+	for (unsigned int i = 0; i<numberOfClasses; i++)
+	{
+		std::cout<<"Mean: " << classMeans[i] << " std: " <<classStd[i] <<std::endl;
+	}
+#endif
+
+	writeTo = NULL;
+	meansEstimator = NULL;
+
+	//boost code
+	const typename TInputImageType::SizeType & size = this->GetInput()->GetRequestedRegion().GetSize();
+	
+#ifndef NDEBUG
+	std::cout << "num_of_nodes: " << node_num << std::endl;
+#endif
+
+	using namespace boost;
+	typedef Graph::vertex_descriptor vertex_descriptor;
+	typedef Graph::edge_descriptor edge_descriptor;  
+	typedef std::pair<edge_descriptor, bool> EdgePair;
+	typedef std::pair<int,int> Pair;
+
+	Graph g(node_num+2);
+
+	int source_id=0;
+	int sink_id=node_num+1;
+	property_map<Graph, float Arc::*>::type capacity
+		= get(&Arc::capacity, g);
+	property_map<Graph, float Arc::*>::type res_capacity
+		= get(&Arc::residual_capacity, g);
+	property_map<Graph, Graph::edge_descriptor Arc::*>::type reverse
+		= get(&Arc::reverse,g);
+	property_map<Graph,Graph::edge_descriptor Node::*>::type predecessor
+		= get(&Node::predecessor,g);
+	property_map<Graph,default_color_type Node::*>::type color
+		= get(&Node::color,g);
+	property_map<Graph,float Node::*>::type distance
+		= get(&Node::distance,g);
+	property_map<Graph,long Node::*>::type index
+		= get(&Node::index,g);
+	vertex_descriptor s, t;
+	EdgePair edge_desc_obj1,edge_desc_obj2,edge_to_source,edge_from_source,edge_to_sink,edge_from_sink;
+	edge_descriptor from_source,from_sink;	
+	
+	
+	//build graph
+	typedef itk::ConstNeighborhoodIterator<TInputImageType> itkConstNeighborhoodIteratorType;
+	typename itkConstNeighborhoodIteratorType::RadiusType radius;
+	radius.Fill(1);
+	itkConstNeighborhoodIteratorType it(radius, this->GetInput(), this->GetInput()->GetRequestedRegion());
+
+	itkConstNeighborhoodIteratorType vertexIt(radius, vertexIndices, this->GetInput()->GetRequestedRegion());
+
+	itkInnerImageRegionConstIteratorType distIt (maskWeights, this->GetInput()->GetRequestedRegion());
+	
+	float edge_weight = 0, source_weight = 0, sink_weight = 0, sigmoid = 0;
+	int cur_node_num,to_node_num;
+	char str[10];
+	
+	typename itkConstNeighborhoodIteratorType::OffsetType offset[27];
+	int offsetIndex = 0;
+	for (int i=0;i<3;i++)
+	{
+        	for (int j=0;j<3;j++)
+		{
+			for (int k=0;k<3;k++)
+			{				
+					offset[offsetIndex][0] = i-1;
+					offset[offsetIndex][1] = j-1;
+					offset[offsetIndex][2] = k-1;
+					offsetIndex++;
+			}
+		}
+	}
+
+#ifndef NDEBUG
+	ImageType::Pointer sigmoidImage = ImageType::New();
+	sigmoidImage->SetSpacing(this->GetInput()->GetSpacing());
+	sigmoidImage->SetOrigin(this->GetInput()->GetOrigin());
+	sigmoidImage->SetRegions(this->GetInput()->GetLargestPossibleRegion());
+	sigmoidImage->Allocate();
+	typedef itk::ImageRegionIterator <ImageType> FloatImageRegionIteratorType;
+	FloatImageRegionIteratorType sigIter(sigmoidImage, sigmoidImage->GetRequestedRegion());
+	sigIter.GoToBegin();
+#endif
+
+	for (it.GoToBegin(), distIt.GoToBegin(), vertexIt.GoToBegin(); !it.IsAtEnd(); ++it, ++distIt, ++vertexIt)
+	{
+		
+		typename TInputImageType::PixelType vertex = vertexIt.GetCenterPixel();
+		typename TInputImageType::PixelType orgValue = it.GetCenterPixel();
+		typename TInputImageType::PixelType dstValue;
+		
+		if (vertex > - 1)
+		{		
+			cur_node_num = vertex;	
+			
+			sigmoid = fabs(2/(1+exp(-0.8*distIt.Value()))-1);
+		#ifndef NDEBUG
+			sigIter.Value() = sigmoid;
+			++sigIter;
+		#endif
+		
+			source_weight = exp(-(double)(orgValue - classMeans[0])*(orgValue - classMeans[0])/(2*classStd[0]*classStd[0]));
+			source_weight = source_weight/sigmoid;
+
+			sink_weight = 0;
+
+			for (unsigned i = 1; i < numberOfClasses - 1; i++)
+			{
+				sink_weight += exp(-(double)(orgValue - classMeans[i])*(orgValue - classMeans[i])/(2 * classStd[i] * classStd[i]));
+			}
+			sink_weight = sink_weight*sigmoid;
+		
+			edge_to_source=add_edge(cur_node_num, source_id,g);
+			g[edge_to_source.first].capacity=source_weight;
+			edge_from_source=add_edge(source_id,cur_node_num,g);
+			g[edge_from_source.first].capacity=source_weight;
+			g[edge_to_source.first].reverse=edge_from_source.first;
+			g[edge_from_source.first].reverse=edge_to_source.first;
+			edge_to_sink=add_edge(cur_node_num, sink_id,g);
+			g[edge_to_sink.first].capacity=sink_weight;
+			edge_from_sink=add_edge(sink_id,cur_node_num,g);
+			g[edge_from_sink.first].capacity=sink_weight;
+			g[edge_to_sink.first].reverse=edge_from_sink.first;
+			g[edge_from_sink.first].reverse=edge_to_sink.first; 
+
+			for (int i=0;i<27;++i)
+			{
+		            if (i == 13)
+		            {
+		                continue;
+		            }
+				to_node_num = vertexIt.GetPixel(offset[i]);
+				if (to_node_num > 0 &&  to_node_num != cur_node_num &&  to_node_num <= node_num)
+				{
+				
+					if (orgValue == 0)
+					{
+						edge_weight = 0;
+					}
+
+					else
+					{
+						dstValue = it.GetPixel(offset[i]);
+						edge_weight = computeEdgeWeight (orgValue, dstValue, 25);
+					}
+
+					edge_desc_obj1=add_edge(cur_node_num, to_node_num,g);
+					g[edge_desc_obj1.first].capacity=edge_weight;
+					edge_desc_obj2=add_edge(to_node_num, cur_node_num,g);
+					g[edge_desc_obj2.first].capacity=edge_weight;                        
+					g[edge_desc_obj1.first].reverse=edge_desc_obj2.first;
+					g[edge_desc_obj2.first].reverse=edge_desc_obj1.first;
+				
+					sprintf(str,"%d",cur_node_num);
+					g[cur_node_num].name=str;
+					g[cur_node_num].index=cur_node_num;
+					g[cur_node_num].color=color_traits<Graph>::gray(); 
+
+				}
+			}
+		}
+	}
+
+#ifndef NDEBUG
+	typedef itk::ImageFileWriter< ImageType > FloatWriterType;
+	typename FloatWriterType::Pointer sigWriter = FloatWriterType::New();
+	sigWriter->SetFileName("sigmoidImage.vtk" );
+	sigWriter->SetInput (sigmoidImage);
+  
+	try
+   	 {
+		sigWriter->Update();
+		std::cout<<"wrote sigImage"<<std::endl;
+   	 }
+	catch( itk::ExceptionObject & excp )
+   	 {
+		std::cerr << "Problem encountered while writing ";
+		std::cerr << " image file : " << "sigmoidImage.vtk" << std::endl;
+		std::cerr << excp << std::endl;
+	}
+#endif
+
+	sprintf(str,"%d",0);
+	g[0].name=str;
+	g[0].index=0;
+	g[0].color=color_traits<Graph>::black();
+	sprintf(str,"%d",node_num+1);
+	g[node_num+1].name=str;
+	g[node_num+1].index=node_num+1;
+	g[node_num+1].color=color_traits<Graph>::white(); 
+
+#ifndef NDEBUG
+	std::cout << "Done building graph " << std::endl;
+#endif
+
+
+	//compute max flow
+	float flow =0;
+	from_source=edge_from_source.first;
+	from_sink=edge_from_sink.first;
+	s=source(from_source,g);
+	t=source(from_sink,g);
+	flow = kolmogorov_max_flow(g,capacity,res_capacity,reverse,predecessor,color,distance,index,s,t);
+#ifndef NDEBUG
+	std::cout << "computed maxflow " << std::endl;
+#endif
+
+	
+	//prepare and update res Image
+	typedef itk::ImageRegionIteratorWithIndex <TOutputImageType> itkOutputImageRegionIteratorWithIndexType;
+	itkOutputImageRegionIteratorWithIndexType res_it( m_ObjImage, m_ObjImage->GetRequestedRegion() );
+
+	for (res_it.GoToBegin(), vertexIter.GoToBegin();!res_it.IsAtEnd(); ++res_it, ++vertexIter)
+	{
+		if (vertexIter.Value() -1)
+		{		
+			if (g[vertexIter.Value()].color==color_traits<Graph>::black())
+			{
+				res_it.Value() = 1;
+			}
+			else
+			{
+				res_it.Value() = 0;
+			}
+		}
+		else
+			res_it.Value() = 0;
+	}
+	
+	this->GraftOutput( m_ObjImage );
+}//GenerateData
+
+
+template <class TInputImageType, class TOutputImageType>
+void
+ActiveContourMinCutImageFilter<TInputImageType, TOutputImageType>::
+PrintSelf( std::ostream& os, Indent indent ) const
+{
+  Superclass::PrintSelf(os,indent);
+
+
+  os << indent << "to do" << std::endl;
+}
+
+} // end namespace itk
